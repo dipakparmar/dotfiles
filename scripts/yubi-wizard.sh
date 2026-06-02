@@ -242,6 +242,55 @@ replace_or_append_line() {
   fi
 }
 
+print_git_config_values() {
+  local key="$1"
+
+  if git config --show-origin --get-all "$key" >/dev/null 2>&1; then
+    git config --show-origin --get-all "$key"
+  else
+    printf '(none)\n'
+  fi
+}
+
+git_config_replace_all_global() {
+  local key="$1"
+  local value="$2"
+  local existing
+  local has_existing=0
+
+  if existing=$(git config --global --get-all "$key" 2>/dev/null); then
+    has_existing=1
+  fi
+
+  if [[ $has_existing -eq 1 ]]; then
+    log "Existing global Git config for $key:"
+    printf '%s\n' "$existing"
+
+    if [[ "$existing" == "$value" ]]; then
+      log "Global Git config already set: $key=$value"
+      return
+    fi
+
+    if ! should_run "Overwrite global Git config $key with: $value?" "n"; then
+      warn "Skipping Git config: $key"
+      return
+    fi
+  else
+    if ! should_run "Set global Git config $key to: $value?" "y"; then
+      warn "Skipping Git config: $key"
+      return
+    fi
+  fi
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf 'DRY-RUN: git config --global --unset-all %s || true\n' "$key"
+    printf 'DRY-RUN: git config --global --add %s %s\n' "$key" "$value"
+  else
+    git config --global --unset-all "$key" 2>/dev/null || true
+    git config --global --add "$key" "$value"
+  fi
+}
+
 ask_yes_no() {
   local prompt="$1"
   local default="${2:-y}"  # y or n
@@ -286,6 +335,7 @@ Steps:
   to-primary  - Move subkeys to primary YubiKey.
   to-backup   - Move subkeys to backup YubiKey.
   ssh-gpg     - Ensure SSH via gpg-agent is configured.
+  git-auth    - Configure GitHub HTTPS credential caching.
   git-sign    - Configure Git to sign commits with this key.
   all         - Run all steps in sequence (default).
 
@@ -622,6 +672,38 @@ step_ssh_gpg() {
   log "  gpg --export-ssh-key \"you@example.com\" > ~/.ssh/yubikey.pub"
 }
 
+# ----- Step: git-auth -----
+step_git_auth() {
+  log "Step: git-auth (configure GitHub HTTPS credential caching)"
+
+  log "Effective Git credential.helper values:"
+  print_git_config_values "credential.helper"
+
+  log "Effective GitHub-specific credential helper values:"
+  print_git_config_values "credential.https://github.com.helper"
+
+  if [[ ! -x "$(git --exec-path)/git-credential-osxkeychain" ]]; then
+    die "git credential-osxkeychain is not available. Install Apple command line tools or use another helper."
+  fi
+
+  git_config_replace_all_global "credential.helper" "osxkeychain"
+
+  if git config --global --get-all "credential.https://github.com.helper" >/dev/null 2>&1; then
+    warn "A GitHub-specific credential helper is set globally. It overrides the generic credential.helper for GitHub."
+    git_config_replace_all_global "credential.https://github.com.helper" "osxkeychain"
+  else
+    log "No global GitHub-specific credential helper is set."
+  fi
+
+  if command -v gh >/dev/null 2>&1; then
+    log "Checking gh auth status:"
+    gh auth status || warn "gh auth is not valid. Git will use osxkeychain after the helper changes above."
+  fi
+
+  log "GitHub HTTPS credential caching configured."
+  log "Next HTTPS Git operation may ask once for credentials, then store them in macOS Keychain."
+}
+
 # ----- Step: git-sign -----
 step_git_sign() {
   log "Step: git-sign (configure Git commit signing)"
@@ -653,6 +735,7 @@ case "$STEP" in
   to-primary)  step_to_primary ;;
   to-backup)   step_to_backup ;;
   ssh-gpg)     step_ssh_gpg ;;
+  git-auth)    step_git_auth ;;
   git-sign)    step_git_sign ;;
   all)
     step_bootstrap
@@ -661,6 +744,7 @@ case "$STEP" in
     step_to_primary
     step_to_backup
     step_ssh_gpg
+    step_git_auth
     step_git_sign
     ;;
   *)
